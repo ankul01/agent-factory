@@ -15,6 +15,7 @@ import {
 import { computeHmacSha256Hex, safeEqual } from "./crypto";
 import {
   extractCursorTrackingUrl,
+  isDeployWorkflow,
   isRequirementStatus,
   matchFeatureBranch,
   matchPlanBranch,
@@ -127,7 +128,7 @@ async function getProjectRequirements(db: AppDb, projectId: number): Promise<Req
     .select()
     .from(requirements)
     .where(eq(requirements.projectId, projectId))
-    .orderBy(desc(requirements.createdAt));
+    .orderBy(desc(requirements.updatedAt), desc(requirements.createdAt));
 }
 
 async function getLatestPlanRun(db: AppDb, requirementId: string): Promise<PlanRunRow | null> {
@@ -366,45 +367,81 @@ export async function handleWorkflowRunWebhook(db: AppDb, payload: unknown): Pro
 
   const reqs = await getProjectRequirements(db, project.id);
   const prNumbers = new Set((run.pull_requests ?? []).map((p) => p.number));
+  const isDeploy = isDeployWorkflow(run.path, run.name);
 
-  // Tier 2 & 3: Branch, PR number, or mergeCommitSha correlation
-  for (const req of reqs) {
-    const latestPlan = await getLatestPlanRun(db, req.id);
-    const primaryTask = await getPrimaryCodingTask(db, req.id);
+  type ReqContext = {
+    req: RequirementRow;
+    latestPlan: PlanRunRow | null;
+    primaryTask: CodingTaskRow | null;
+  };
+  const contexts: ReqContext[] = await Promise.all(
+    reqs.map(async (req) => ({
+      req,
+      latestPlan: await getLatestPlanRun(db, req.id),
+      primaryTask: await getPrimaryCodingTask(db, req.id),
+    })),
+  );
 
-    const isPlanBranch = matchPlanBranch(run.head_branch, req.slug).matched;
-    const isPlanPr = latestPlan?.prNumber ? prNumbers.has(latestPlan.prNumber) : false;
+  const recordDeployRun = async (ctx: ReqContext) => {
+    const isCompleted = action === "completed";
+    const smokeTestStatus = isCompleted
+      ? conclusion === "success"
+        ? "PASSED"
+        : "FAILED"
+      : "PENDING";
 
-    if (isPlanBranch || isPlanPr) {
-      if (isFailure && latestPlan) {
-        await db
-          .update(planRuns)
-          .set({
-            ghRunId,
-            ghRunUrl: run.html_url,
-            status: "FAILED",
-            failureReason: failureMsg,
-            updatedAt: new Date(),
-          })
-          .where(eq(planRuns.id, latestPlan.id));
-        await updateRequirementStatus(db, req, "FAILED", failureMsg);
-        return `marked plan_run FAILED via branch/PR for ${req.slug}`;
+    await db
+      .insert(deployments)
+      .values({
+        requirementId: ctx.req.id,
+        codingTaskId: ctx.primaryTask?.id ?? null,
+        commitSha: run.head_sha,
+        ghRunId,
+        ghRunUrl: run.html_url,
+        smokeTestStatus,
+        deployedAt: isCompleted && conclusion === "success" ? new Date() : null,
+      })
+      .onConflictDoUpdate({
+        target: [deployments.requirementId, deployments.ghRunId],
+        set: {
+          ghRunUrl: run.html_url,
+          smokeTestStatus,
+          ...(isCompleted && conclusion === "success" ? { deployedAt: new Date() } : {}),
+        },
+      });
+
+    if (isCompleted) {
+      if (conclusion === "success") {
+        await updateRequirementStatus(db, ctx.req, "DEPLOYED", null);
+      } else {
+        await updateRequirementStatus(
+          db,
+          ctx.req,
+          "FAILED",
+          failureMsg ?? `Workflow ${run.name ?? ghRunId} ${conclusion ?? "failed"}`,
+        );
       }
-      continue;
+    } else {
+      await updateRequirementStatus(db, ctx.req, "DEPLOYING");
     }
+    return `correlated deploy run ${ghRunId} for ${ctx.req.slug}`;
+  };
 
-    // trigger-coder.yml correlation via mergeCommitSha on plan_runs
+  // Priority a: Exact mergeCommitSha === run.head_sha
+  for (const ctx of contexts) {
+    if (ctx.primaryTask?.mergeCommitSha === run.head_sha && isDeploy) {
+      return recordDeployRun(ctx);
+    }
     if (
-      latestPlan?.mergeCommitSha &&
-      latestPlan.mergeCommitSha === run.head_sha &&
+      ctx.latestPlan?.mergeCommitSha === run.head_sha &&
       workflowPath.includes("coder")
     ) {
       await db
         .insert(codingTasks)
         .values({
-          requirementId: req.id,
-          planRunId: latestPlan.id,
-          featureSlug: req.slug,
+          requirementId: ctx.req.id,
+          planRunId: ctx.latestPlan.id,
+          featureSlug: ctx.req.slug,
           ghRunId,
           ghRunUrl: run.html_url,
           status: isFailure ? "FAILED" : "RUNNING",
@@ -423,25 +460,110 @@ export async function handleWorkflowRunWebhook(db: AppDb, payload: unknown): Pro
 
       await updateRequirementStatus(
         db,
-        req,
+        ctx.req,
         isFailure ? "FAILED" : "CODING",
         isFailure ? failureMsg : undefined,
       );
-      return `correlated trigger-coder run ${ghRunId} for ${req.slug}`;
+      return `correlated trigger-coder run ${ghRunId} for ${ctx.req.slug}`;
+    }
+  }
+
+  // Priority b: Exact branchName === run.head_branch
+  if (run.head_branch) {
+    for (const ctx of contexts) {
+      if (ctx.primaryTask?.branchName === run.head_branch) {
+        if (isDeploy) {
+          return recordDeployRun(ctx);
+        }
+        if (workflowPath.includes("review") && ctx.primaryTask) {
+          const testStatus =
+            action === "completed" ? (conclusion === "success" ? "PASSED" : "FAILED") : "PENDING";
+          await db
+            .insert(reviewRuns)
+            .values({
+              codingTaskId: ctx.primaryTask.id,
+              ghRunId,
+              ghRunUrl: run.html_url,
+              testStatus,
+            })
+            .onConflictDoUpdate({
+              target: [reviewRuns.codingTaskId, reviewRuns.ghRunId],
+              set: {
+                ghRunUrl: run.html_url,
+                testStatus,
+                updatedAt: new Date(),
+              },
+            });
+          await updateRequirementStatus(
+            db,
+            ctx.req,
+            isFailure ? "FAILED" : "IN_REVIEW",
+            isFailure ? failureMsg : undefined,
+          );
+          return `correlated pr-review run ${ghRunId} for ${ctx.req.slug}`;
+        }
+      }
+
+      if (ctx.latestPlan?.branchName === run.head_branch && isFailure) {
+        await db
+          .update(planRuns)
+          .set({
+            ghRunId,
+            ghRunUrl: run.html_url,
+            status: "FAILED",
+            failureReason: failureMsg,
+            updatedAt: new Date(),
+          })
+          .where(eq(planRuns.id, ctx.latestPlan.id));
+        await updateRequirementStatus(db, ctx.req, "FAILED", failureMsg);
+        return `marked plan_run FAILED via exact branch for ${ctx.req.slug}`;
+      }
+    }
+  }
+
+  // Priority c: Regex match on run.head_branch using matchPlanBranch / matchFeatureBranch
+  for (const ctx of contexts) {
+    const isPlanBranch = matchPlanBranch(run.head_branch, ctx.req.slug).matched;
+    const isPlanPr = ctx.latestPlan?.prNumber ? prNumbers.has(ctx.latestPlan.prNumber) : false;
+
+    if (isPlanBranch || isPlanPr) {
+      if (isFailure && ctx.latestPlan) {
+        await db
+          .update(planRuns)
+          .set({
+            ghRunId,
+            ghRunUrl: run.html_url,
+            status: "FAILED",
+            failureReason: failureMsg,
+            updatedAt: new Date(),
+          })
+          .where(eq(planRuns.id, ctx.latestPlan.id));
+        await updateRequirementStatus(db, ctx.req, "FAILED", failureMsg);
+        return `marked plan_run FAILED via branch/PR for ${ctx.req.slug}`;
+      }
+      continue;
     }
 
-    // pr-review.yml correlation via feature branch or PR number
-    const isFeatureBranch = matchFeatureBranch(run.head_branch, req.slug, latestPlan?.planId);
-    const isCodingPr = primaryTask?.prNumber ? prNumbers.has(primaryTask.prNumber) : false;
+    const isFeatureBranch = matchFeatureBranch(
+      run.head_branch,
+      ctx.req.slug,
+      ctx.latestPlan?.planId,
+    );
+    const isCodingPr = ctx.primaryTask?.prNumber
+      ? prNumbers.has(ctx.primaryTask.prNumber)
+      : false;
 
-    if ((isFeatureBranch || isCodingPr) && primaryTask) {
+    if ((isFeatureBranch || isCodingPr) && ctx.primaryTask) {
+      if (isDeploy) {
+        return recordDeployRun(ctx);
+      }
       if (workflowPath.includes("review")) {
         const testStatus =
           action === "completed" ? (conclusion === "success" ? "PASSED" : "FAILED") : "PENDING";
         await db
           .insert(reviewRuns)
           .values({
-            codingTaskId: primaryTask.id,
+            codingTaskId: ctx.primaryTask.id,
             ghRunId,
             ghRunUrl: run.html_url,
             testStatus,
@@ -456,50 +578,41 @@ export async function handleWorkflowRunWebhook(db: AppDb, payload: unknown): Pro
           });
 
         if (isFailure) {
-          await updateRequirementStatus(db, req, "FAILED", failureMsg);
+          await updateRequirementStatus(db, ctx.req, "FAILED", failureMsg);
         } else {
-          await updateRequirementStatus(db, req, "IN_REVIEW");
+          await updateRequirementStatus(db, ctx.req, "IN_REVIEW");
         }
-        return `correlated pr-review run ${ghRunId} for ${req.slug}`;
+        return `correlated pr-review run ${ghRunId} for ${ctx.req.slug}`;
+      }
+    }
+  }
+
+  // Priority d: Deploy workflow fallback by PR number or main-branch DEPLOYING / MERGED requirement
+  if (isDeploy) {
+    for (const ctx of contexts) {
+      if (ctx.primaryTask?.prNumber && prNumbers.has(ctx.primaryTask.prNumber)) {
+        return recordDeployRun(ctx);
       }
     }
 
-    // deploy.yml correlation via codingTasks.mergeCommitSha
-    if (
-      primaryTask?.mergeCommitSha &&
-      primaryTask.mergeCommitSha === run.head_sha &&
-      workflowPath.includes("deploy")
-    ) {
-      const smokeTestStatus =
-        action === "completed" ? (conclusion === "success" ? "PASSED" : "FAILED") : "PENDING";
-      await db
-        .insert(deployments)
-        .values({
-          requirementId: req.id,
-          codingTaskId: primaryTask.id,
-          commitSha: run.head_sha,
-          ghRunId,
-          ghRunUrl: run.html_url,
-          smokeTestStatus,
-          deployedAt: smokeTestStatus === "PASSED" ? new Date() : null,
-        })
-        .onConflictDoUpdate({
-          target: [deployments.requirementId, deployments.ghRunId],
-          set: {
-            ghRunUrl: run.html_url,
-            smokeTestStatus,
-            ...(smokeTestStatus === "PASSED" ? { deployedAt: new Date() } : {}),
-          },
-        });
-
-      if (isFailure) {
-        await updateRequirementStatus(db, req, "FAILED", failureMsg);
-      } else if (smokeTestStatus === "PASSED") {
-        await updateRequirementStatus(db, req, "DEPLOYED", null);
-      } else {
-        await updateRequirementStatus(db, req, "DEPLOYING");
+    if (run.head_branch === "main" || run.head_branch === project.defaultBranch) {
+      const deployingCtx = contexts.find((c) => c.req.status === "DEPLOYING");
+      if (deployingCtx) {
+        return recordDeployRun(deployingCtx);
       }
-      return `correlated deploy run ${ghRunId} for ${req.slug}`;
+
+      for (const ctx of contexts) {
+        if (ctx.primaryTask?.status === "MERGED") {
+          const [existingDep] = await db
+            .select({ id: deployments.id })
+            .from(deployments)
+            .where(eq(deployments.requirementId, ctx.req.id))
+            .limit(1);
+          if (!existingDep) {
+            return recordDeployRun(ctx);
+          }
+        }
+      }
     }
   }
 
@@ -638,8 +751,24 @@ export async function handleReleaseWebhook(db: AppDb, payload: unknown): Promise
   }
 
   if (!targetReq) {
-    targetReq = reqs.find((r) => r.status === "DEPLOYING") ?? null;
-    if (targetReq) {
+    const candidates = reqs.filter(
+      (r) => r.status === "DEPLOYING" || r.status === "DEPLOYED",
+    );
+    for (const candidate of candidates) {
+      const [dep] = await db
+        .select()
+        .from(deployments)
+        .where(eq(deployments.requirementId, candidate.id))
+        .orderBy(desc(deployments.createdAt))
+        .limit(1);
+      if (!dep || !dep.releaseTag) {
+        targetReq = candidate;
+        targetTask = await getPrimaryCodingTask(db, candidate.id);
+        break;
+      }
+    }
+    if (!targetReq && candidates.length > 0) {
+      targetReq = candidates[0];
       targetTask = await getPrimaryCodingTask(db, targetReq.id);
     }
   }
@@ -648,28 +777,49 @@ export async function handleReleaseWebhook(db: AppDb, payload: unknown): Promise
     return `ignored: no matching requirement for release ${release.tag_name}`;
   }
 
-  await db
-    .insert(deployments)
-    .values({
-      requirementId: targetReq.id,
-      codingTaskId: targetTask?.id ?? null,
-      releaseTag: release.tag_name,
-      releaseUrl: release.html_url,
-      commitSha: release.target_commitish,
-      ghRunId: `release-${release.tag_name}`,
-      smokeTestStatus: "PASSED",
-      deployedAt: release.published_at ? new Date(release.published_at) : new Date(),
-    })
-    .onConflictDoUpdate({
-      target: [deployments.requirementId, deployments.ghRunId],
-      set: {
+  const deployedAt = release.published_at ? new Date(release.published_at) : new Date();
+  const [existingDep] = await db
+    .select()
+    .from(deployments)
+    .where(eq(deployments.requirementId, targetReq.id))
+    .orderBy(desc(deployments.createdAt))
+    .limit(1);
+
+  if (existingDep && !existingDep.releaseTag) {
+    await db
+      .update(deployments)
+      .set({
+        releaseTag: release.tag_name,
+        releaseUrl: release.html_url,
+        commitSha: existingDep.commitSha ?? release.target_commitish,
+        smokeTestStatus: "PASSED",
+        deployedAt: existingDep.deployedAt ?? deployedAt,
+      })
+      .where(eq(deployments.id, existingDep.id));
+  } else {
+    await db
+      .insert(deployments)
+      .values({
+        requirementId: targetReq.id,
+        codingTaskId: targetTask?.id ?? null,
         releaseTag: release.tag_name,
         releaseUrl: release.html_url,
         commitSha: release.target_commitish,
+        ghRunId: `release-${release.tag_name}`,
         smokeTestStatus: "PASSED",
-        deployedAt: release.published_at ? new Date(release.published_at) : new Date(),
-      },
-    });
+        deployedAt,
+      })
+      .onConflictDoUpdate({
+        target: [deployments.requirementId, deployments.ghRunId],
+        set: {
+          releaseTag: release.tag_name,
+          releaseUrl: release.html_url,
+          commitSha: release.target_commitish,
+          smokeTestStatus: "PASSED",
+          deployedAt,
+        },
+      });
+  }
 
   await updateRequirementStatus(db, targetReq, "DEPLOYED", null);
   return `recorded release ${release.tag_name} for ${targetReq.slug}`;

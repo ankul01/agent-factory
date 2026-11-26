@@ -21,6 +21,7 @@ import {
 } from "@/lib/github";
 import {
   extractCursorTrackingUrl,
+  isDeployWorkflow,
   isRequirementStatus,
   matchFeatureBranch,
   matchPlanBranch,
@@ -278,6 +279,7 @@ export async function POST(
   }
 
   // 3. Reconcile Workflow Runs (planner, trigger-coder, pr-review, deploy)
+  let matchedDeployRun = false;
   for (const run of workflowRuns) {
     const ghRunId = String(run.id);
     const conclusion = run.conclusion ?? null;
@@ -286,6 +288,7 @@ export async function POST(
       conclusion !== null &&
       ["failure", "timed_out", "cancelled", "startup_failure"].includes(conclusion);
     const workflowPath = (run.path ?? run.name ?? "").toLowerCase();
+    const isDeploy = isDeployWorkflow(run.path, run.name);
     const failureMsg = isFailure ? `Workflow ${run.name ?? ghRunId} ${conclusion}` : null;
 
     if (latestPlan?.ghRunId === ghRunId || matchPlanBranch(run.head_branch, req.slug).matched) {
@@ -341,7 +344,8 @@ export async function POST(
     const prNumbers = new Set((run.pull_requests ?? []).map((p) => p.number));
     if (
       primaryTask &&
-      (matchFeatureBranch(run.head_branch, req.slug, latestPlan?.planId) ||
+      (primaryTask.branchName === run.head_branch ||
+        matchFeatureBranch(run.head_branch, req.slug, latestPlan?.planId) ||
         (primaryTask.prNumber !== null && prNumbers.has(primaryTask.prNumber))) &&
       workflowPath.includes("review")
     ) {
@@ -373,10 +377,12 @@ export async function POST(
     }
 
     if (
-      primaryTask?.mergeCommitSha &&
-      primaryTask.mergeCommitSha === run.head_sha &&
-      workflowPath.includes("deploy")
+      isDeploy &&
+      primaryTask &&
+      ((primaryTask.mergeCommitSha && primaryTask.mergeCommitSha === run.head_sha) ||
+        (primaryTask.branchName && primaryTask.branchName === run.head_branch))
     ) {
+      matchedDeployRun = true;
       const smokeTestStatus =
         run.status === "completed" ? (conclusion === "success" ? "PASSED" : "FAILED") : "PENDING";
       await db
@@ -411,38 +417,116 @@ export async function POST(
     }
   }
 
-  // 4. Reconcile Releases
-  if (primaryTask?.mergeCommitSha) {
-    const matchingRelease = releases.find(
-      (rel) => rel.target_commitish === primaryTask?.mergeCommitSha,
+  // Fallback for MERGED coding task with no matched deploy run yet
+  if (!matchedDeployRun && primaryTask?.status === "MERGED") {
+    const mergedAtMs = primaryTask.updatedAt.getTime();
+    const fallbackDeployRun = workflowRuns.find(
+      (run) =>
+        isDeployWorkflow(run.path, run.name) &&
+        run.status === "completed" &&
+        (new Date(run.created_at).getTime() >= mergedAtMs - 60_000 ||
+          (primaryTask?.branchName !== null && run.head_branch === primaryTask?.branchName)),
     );
-    if (matchingRelease) {
+
+    if (fallbackDeployRun) {
+      const ghRunId = String(fallbackDeployRun.id);
+      const conclusion = fallbackDeployRun.conclusion ?? null;
+      const isFailure =
+        conclusion !== null &&
+        ["failure", "timed_out", "cancelled", "startup_failure"].includes(conclusion);
+      const smokeTestStatus = conclusion === "success" ? "PASSED" : "FAILED";
+      const failureMsg = isFailure
+        ? `Workflow ${fallbackDeployRun.name ?? ghRunId} ${conclusion}`
+        : null;
+
       await db
         .insert(deployments)
         .values({
           requirementId: req.id,
           codingTaskId: primaryTask.id,
-          releaseTag: matchingRelease.tag_name,
-          releaseUrl: matchingRelease.html_url,
-          commitSha: matchingRelease.target_commitish,
-          ghRunId: `release-${matchingRelease.tag_name}`,
-          smokeTestStatus: "PASSED",
-          deployedAt: matchingRelease.published_at
-            ? new Date(matchingRelease.published_at)
-            : new Date(matchingRelease.created_at),
+          commitSha: fallbackDeployRun.head_sha,
+          ghRunId,
+          ghRunUrl: fallbackDeployRun.html_url,
+          smokeTestStatus,
+          deployedAt:
+            smokeTestStatus === "PASSED" ? new Date(fallbackDeployRun.updated_at) : null,
         })
         .onConflictDoUpdate({
           target: [deployments.requirementId, deployments.ghRunId],
           set: {
+            ghRunUrl: fallbackDeployRun.html_url,
+            smokeTestStatus,
+            ...(smokeTestStatus === "PASSED"
+              ? { deployedAt: new Date(fallbackDeployRun.updated_at) }
+              : {}),
+          },
+        });
+
+      if (isFailure) {
+        advance("FAILED", failureMsg);
+      } else if (smokeTestStatus === "PASSED") {
+        advance("DEPLOYED", null);
+      }
+    }
+  }
+
+  // 4. Reconcile Releases
+  if (primaryTask?.mergeCommitSha || primaryTask?.status === "MERGED") {
+    const matchingRelease =
+      (primaryTask.mergeCommitSha
+        ? releases.find((rel) => rel.target_commitish === primaryTask?.mergeCommitSha)
+        : undefined) ??
+      releases.find(
+        (rel) =>
+          primaryTask &&
+          new Date(rel.created_at).getTime() >= primaryTask.updatedAt.getTime() - 60_000,
+      );
+
+    if (matchingRelease) {
+      const existingDeps = await db
+        .select()
+        .from(deployments)
+        .where(eq(deployments.requirementId, req.id));
+      const missingReleaseDep = existingDeps.find((d) => !d.releaseTag);
+      const deployedAt = matchingRelease.published_at
+        ? new Date(matchingRelease.published_at)
+        : new Date(matchingRelease.created_at);
+
+      if (missingReleaseDep) {
+        await db
+          .update(deployments)
+          .set({
+            releaseTag: matchingRelease.tag_name,
+            releaseUrl: matchingRelease.html_url,
+            commitSha: missingReleaseDep.commitSha ?? matchingRelease.target_commitish,
+            smokeTestStatus: "PASSED",
+            deployedAt: missingReleaseDep.deployedAt ?? deployedAt,
+          })
+          .where(eq(deployments.id, missingReleaseDep.id));
+      } else {
+        await db
+          .insert(deployments)
+          .values({
+            requirementId: req.id,
+            codingTaskId: primaryTask.id,
             releaseTag: matchingRelease.tag_name,
             releaseUrl: matchingRelease.html_url,
             commitSha: matchingRelease.target_commitish,
+            ghRunId: `release-${matchingRelease.tag_name}`,
             smokeTestStatus: "PASSED",
-            deployedAt: matchingRelease.published_at
-              ? new Date(matchingRelease.published_at)
-              : new Date(matchingRelease.created_at),
-          },
-        });
+            deployedAt,
+          })
+          .onConflictDoUpdate({
+            target: [deployments.requirementId, deployments.ghRunId],
+            set: {
+              releaseTag: matchingRelease.tag_name,
+              releaseUrl: matchingRelease.html_url,
+              commitSha: matchingRelease.target_commitish,
+              smokeTestStatus: "PASSED",
+              deployedAt,
+            },
+          });
+      }
       advance("DEPLOYED", null);
     }
   }

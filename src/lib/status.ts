@@ -99,7 +99,7 @@ export function matchPlanBranch(
 /**
  * Anchored match for coding feature branches:
  * - feat/<planId> (when planId is known)
- * - ^(feat|fix|chore|cursor)/(<YYYYMMDD-HHMMSS>-)?<slug>$
+ * - ^(?:cursor|feat|feature|fix)/(?:implement-)?(?:\d{8}-\d{6}-)?<slug>(?:-[a-f0-9]{4,8})?$
  */
 export function matchFeatureBranch(
   branchName: string | null | undefined,
@@ -115,8 +115,30 @@ export function matchFeatureBranch(
   }
 
   const escaped = escapeRegExp(slug);
-  const re = new RegExp(`^(?:feat|fix|chore|cursor)/(?:\\d{8}-\\d{6}-)?${escaped}$`);
+  const re = new RegExp(
+    `^(?:cursor|feat|feature|fix)/(?:implement-)?(?:\\d{8}-\\d{6}-)?${escaped}(?:-[a-f0-9]{4,8})?$`,
+  );
   return re.test(branchName);
+}
+
+/**
+ * Identifies whether a GitHub Actions workflow run belongs to a deploy workflow.
+ */
+export function isDeployWorkflow(
+  path?: string | null,
+  name?: string | null,
+): boolean {
+  const normalizedPath = (path ?? "").toLowerCase().replace(/@.*$/, "");
+  if (
+    normalizedPath === "deploy.yml" ||
+    normalizedPath === "deploy.yaml" ||
+    normalizedPath.endsWith("/deploy.yml") ||
+    normalizedPath.endsWith("/deploy.yaml")
+  ) {
+    return true;
+  }
+
+  return (name ?? "").toLowerCase().includes("deploy");
 }
 
 /**

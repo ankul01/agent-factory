@@ -3,6 +3,7 @@ import test from "node:test";
 import { computeHmacSha256Hex } from "./crypto";
 import {
   extractCursorTrackingUrl,
+  isDeployWorkflow,
   matchFeatureBranch,
   matchPlanBranch,
   matchPlanReferenceInBody,
@@ -38,6 +39,18 @@ test("anchored branch matching prevents substring collisions", () => {
   assert.equal(matchFeatureBranch("feat/20261125-170000-auth", "auth", "20261125-170000-auth"), true);
   assert.equal(matchFeatureBranch("feat/20261125-170000-auth-v2", "auth"), false);
   assert.equal(
+    matchFeatureBranch("cursor/implement-20261125-171459-api-ping-endpoint-ac3c", "api-ping-endpoint"),
+    true,
+  );
+  assert.equal(
+    matchFeatureBranch("cursor/20261125-171459-api-ping-endpoint", "api-ping-endpoint"),
+    true,
+  );
+  assert.equal(
+    matchFeatureBranch("cursor/implement-20261125-171459-auth-v2-ac3c", "auth"),
+    false,
+  );
+  assert.equal(
     matchPlanReferenceInBody("Implements docs/plans/20261125-170000-auth.md", "auth", "20261125-170000-auth"),
     true,
   );
@@ -45,6 +58,15 @@ test("anchored branch matching prevents substring collisions", () => {
     matchPlanReferenceInBody("Implements docs/plans/20261125-170000-auth-v2.md", "auth"),
     false,
   );
+});
+
+test("isDeployWorkflow identifies deploy workflow paths and names accurately", () => {
+  assert.equal(
+    isDeployWorkflow(".github/workflows/deploy.yml", "Package, Smoke Test, and Deploy Staging"),
+    true,
+  );
+  assert.equal(isDeployWorkflow(".github/workflows/deploy.yml@main", "CI"), true);
+  assert.equal(isDeployWorkflow(".github/workflows/pr-review.yml", "PR Review"), false);
 });
 
 test("nextRequirementStatus enforces monotonic progression, failure propagation, and recovery", () => {

@@ -1,0 +1,227 @@
+name: Reusable Deploy to Render Free via GHCR
+
+on:
+  workflow_call:
+    inputs:
+      staging_url:
+        description: "Live Render staging base URL (e.g. https://task-manager.onrender.com)"
+        required: false
+        type: string
+        default: ""
+      health_path:
+        description: "HTTP health check path returning 200 OK"
+        required: true
+        type: string
+        default: "/api/ping"
+      image_name:
+        description: "Container image name (e.g. task-manager)"
+        required: true
+        type: string
+      factory_webhook_url:
+        description: "Agent Factory deploy webhook URL"
+        required: false
+        type: string
+        default: "https://agent-factory-weld.vercel.app/api/webhooks/deploy"
+      smoke_timeout_sec:
+        description: "Smoke test polling timeout in seconds"
+        required: false
+        type: number
+        default: 120
+    secrets:
+      RENDER_DEPLOY_HOOK_URL:
+        description: "Render deploy hook URL"
+        required: false
+      FACTORY_WEBHOOK_SECRET:
+        description: "HMAC-SHA256 secret for Agent Factory deploy webhook"
+        required: true
+
+jobs:
+  deploy-render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          IMAGE_REPO="ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}/${{ inputs.image_name }}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_URI="${IMAGE_REPO}:${SHORT_SHA}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "image_repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "run_url=$RUN_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Dockerfile exists
+        shell: bash
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::error::Missing Dockerfile. Submit a Factory requirement using skills/backend-java.md first."
+            exit 1
+          fi
+
+      - name: Notify Factory (deploying)
+        if: inputs.staging_url != ''
+        env:
+          WEBHOOK_URL: ${{ inputs.factory_webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.FACTORY_WEBHOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          STAGING_URL: ${{ inputs.staging_url }}
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
+          RUN_URL: ${{ steps.meta.outputs.run_url }}
+        shell: bash
+        run: |
+          PAYLOAD=$(jq -cn \
+            --arg repo "$REPO" \
+            --arg commitSha "$COMMIT_SHA" \
+            --arg provider "render" \
+            --arg environment "staging" \
+            --arg stagingUrl "$STAGING_URL" \
+            --arg status "deploying" \
+            --arg imageUri "$IMAGE_URI" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{repo: $repo, commitSha: $commitSha, provider: $provider, environment: $environment, stagingUrl: ($stagingUrl | if . == "" then null else . end), status: $status, imageUri: $imageUri, workflowRunUrl: $workflowRunUrl}')
+          SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $NF}')
+          curl -sfS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Factory-Signature-256: sha256=${SIG}" \
+            -d "$PAYLOAD" || echo "::warning::Failed to send deploying webhook to Factory"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+            ${{ steps.meta.outputs.image_repo }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trigger Render Deploy Hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          STAGING_URL: ${{ inputs.staging_url }}
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
+        shell: bash
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ] || [ -z "$STAGING_URL" ]; then
+            echo "::notice::GHCR image pushed; set RENDER_DEPLOY_HOOK_URL and RENDER_STAGING_URL to enable Render rollout & smoke test"
+            exit 0
+          fi
+          ENCODED_IMG=$(jq -rn --arg v "$IMAGE_URI" '$v | @uri')
+          SEP="&"
+          if [[ "$RENDER_DEPLOY_HOOK_URL" != *"?"* ]]; then
+            SEP="?"
+          fi
+          curl -sfS "${RENDER_DEPLOY_HOOK_URL}${SEP}imgURL=${ENCODED_IMG}"
+          echo "Triggered Render rollout for $IMAGE_URI"
+
+      - name: Live Staging Smoke Test
+        id: smoke
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          STAGING_URL: ${{ inputs.staging_url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+          TIMEOUT_SEC: ${{ inputs.smoke_timeout_sec }}
+        shell: bash
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ] || [ -z "$STAGING_URL" ]; then
+            echo "::notice::GHCR image pushed; set RENDER_DEPLOY_HOOK_URL and RENDER_STAGING_URL to enable Render rollout & smoke test"
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "latency_ms=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE_URL="${STAGING_URL%/}"
+          CLEAN_HEALTH_PATH="/${HEALTH_PATH#/}"
+          TARGET_URL="${BASE_URL}${CLEAN_HEALTH_PATH}"
+
+          echo "Waiting 20s for Render to pull new image..."
+          sleep 20
+
+          DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+          while [ "$(date +%s)" -le "$DEADLINE" ]; do
+            START_MS=$(date +%s%3N)
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$TARGET_URL" || true)
+            END_MS=$(date +%s%3N)
+            LATENCY_MS=$(( END_MS - START_MS ))
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Smoke test passed: $TARGET_URL returned 200 in ${LATENCY_MS}ms"
+              echo "status=passed" >> "$GITHUB_OUTPUT"
+              echo "latency_ms=$LATENCY_MS" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Polling $TARGET_URL -> HTTP $HTTP_CODE; retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Smoke test timed out after ${TIMEOUT_SEC}s"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "latency_ms=0" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Notify Factory (live or failed)
+        if: always() && (inputs.staging_url != '' || job.status != 'success')
+        env:
+          WEBHOOK_URL: ${{ inputs.factory_webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.FACTORY_WEBHOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          STAGING_URL: ${{ inputs.staging_url }}
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
+          RUN_URL: ${{ steps.meta.outputs.run_url }}
+          JOB_STATUS: ${{ job.status }}
+          SMOKE_STATUS: ${{ steps.smoke.outputs.status }}
+          SMOKE_LATENCY_MS: ${{ steps.smoke.outputs.latency_ms }}
+        shell: bash
+        run: |
+          DEPLOY_STATUS="failed"
+          if [ "$JOB_STATUS" = "success" ]; then
+            DEPLOY_STATUS="live"
+          fi
+          FINAL_SMOKE="${SMOKE_STATUS:-skipped}"
+          LATENCY_JSON="null"
+          if [ -n "$SMOKE_LATENCY_MS" ] && [ "$SMOKE_LATENCY_MS" -gt 0 ] 2>/dev/null; then
+            LATENCY_JSON="$SMOKE_LATENCY_MS"
+          fi
+
+          PAYLOAD=$(jq -cn \
+            --arg repo "$REPO" \
+            --arg commitSha "$COMMIT_SHA" \
+            --arg provider "render" \
+            --arg environment "staging" \
+            --arg stagingUrl "$STAGING_URL" \
+            --arg status "$DEPLOY_STATUS" \
+            --arg smokeTestStatus "$FINAL_SMOKE" \
+            --argjson smokeTestLatencyMs "$LATENCY_JSON" \
+            --arg imageUri "$IMAGE_URI" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{repo: $repo, commitSha: $commitSha, provider: $provider, environment: $environment, stagingUrl: ($stagingUrl | if . == "" then null else . end), status: $status, smokeTestStatus: $smokeTestStatus, smokeTestLatencyMs: $smokeTestLatencyMs, imageUri: $imageUri, workflowRunUrl: $workflowRunUrl}')
+          SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $NF}')
+          curl -sfS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Factory-Signature-256: sha256=${SIG}" \
+            -d "$PAYLOAD" || echo "::warning::Failed to send final deploy webhook to Factory"

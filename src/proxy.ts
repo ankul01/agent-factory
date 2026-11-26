@@ -7,6 +7,7 @@ const PUBLIC_EXACT_PATHS = new Set([
   "/api/auth/logout",
   "/api/health",
   "/api/webhooks/github",
+  "/api/webhooks/deploy",
   "/api/callbacks/workflow",
   "/favicon.ico",
 ]);

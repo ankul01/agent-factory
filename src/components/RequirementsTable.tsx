@@ -87,7 +87,14 @@ export interface RequirementListItem {
     id: string;
     releaseTag: string | null;
     releaseUrl: string | null;
+    commitSha: string | null;
+    deployProvider: string | null;
+    deployEnvironment: string | null;
+    stagingUrl: string | null;
+    deployStatus: string | null;
     smokeTestStatus: string;
+    smokeTestLatencyMs: number | null;
+    deployRunUrl: string | null;
   } | null;
 }
 
@@ -269,20 +276,98 @@ export function RequirementsTable({
 
                 <td className="px-4 py-3 align-top">
                   {req.latestDeployment ? (
-                    <div className="space-y-1">
-                      <StatusBadge status={req.latestDeployment.smokeTestStatus} />
-                      {req.latestDeployment.releaseTag && req.latestDeployment.releaseUrl && (
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {req.latestDeployment.deployStatus ? (
+                          <span
+                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${
+                              req.latestDeployment.deployStatus === "live"
+                                ? "bg-emerald-100 text-emerald-800 ring-emerald-300"
+                                : req.latestDeployment.deployStatus === "deploying"
+                                  ? "animate-pulse bg-amber-100 text-amber-800 ring-amber-300"
+                                  : "bg-rose-100 text-rose-800 ring-rose-300"
+                            }`}
+                          >
+                            {req.latestDeployment.deployStatus}
+                          </span>
+                        ) : (
+                          <StatusBadge status={req.latestDeployment.smokeTestStatus} />
+                        )}
+
+                        {req.latestDeployment.deployProvider && (
+                          <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-700">
+                            {req.latestDeployment.deployProvider === "render"
+                              ? "Render Free · GHCR"
+                              : req.latestDeployment.deployProvider}
+                          </span>
+                        )}
+                      </div>
+
+                      {req.latestDeployment.stagingUrl && (
                         <div>
+                          <a
+                            href={req.latestDeployment.stagingUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:underline"
+                          >
+                            <span>Live Staging</span>
+                            <svg
+                              className="h-3 w-3"
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              stroke="currentColor"
+                              strokeWidth={2}
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+                              />
+                            </svg>
+                          </a>
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        {req.latestDeployment.smokeTestStatus === "PASSED" && (
+                          <span className="rounded bg-emerald-50 px-1.5 py-0.5 font-mono text-[11px] text-emerald-800">
+                            {req.latestDeployment.smokeTestLatencyMs !== null
+                              ? `200 OK · ${req.latestDeployment.smokeTestLatencyMs}ms`
+                              : "200 OK"}
+                          </span>
+                        )}
+                        {req.latestDeployment.smokeTestStatus === "FAILED" && (
+                          <span className="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-800">
+                            Smoke Failed
+                          </span>
+                        )}
+                        {req.latestDeployment.commitSha && (
+                          <span className="font-mono text-[11px] text-slate-500">
+                            {req.latestDeployment.commitSha.slice(0, 7)}
+                          </span>
+                        )}
+                        {req.latestDeployment.deployRunUrl && (
+                          <a
+                            href={req.latestDeployment.deployRunUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-slate-600 hover:underline"
+                          >
+                            Run
+                          </a>
+                        )}
+                        {req.latestDeployment.releaseTag && req.latestDeployment.releaseUrl && (
                           <a
                             href={req.latestDeployment.releaseUrl}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="font-mono text-xs font-medium text-emerald-700 hover:underline"
+                            className="font-mono font-medium text-emerald-700 hover:underline"
                           >
                             {req.latestDeployment.releaseTag}
                           </a>
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </div>
                   ) : (
                     <span className="text-xs text-slate-400">—</span>

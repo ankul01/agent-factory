@@ -176,7 +176,14 @@ export default async function DashboardPage() {
             id: deploy.id,
             releaseTag: deploy.releaseTag,
             releaseUrl: deploy.releaseUrl,
+            commitSha: deploy.commitSha,
+            deployProvider: deploy.deployProvider,
+            deployEnvironment: deploy.deployEnvironment,
+            stagingUrl: deploy.stagingUrl,
+            deployStatus: deploy.deployStatus,
             smokeTestStatus: deploy.smokeTestStatus,
+            smokeTestLatencyMs: deploy.smokeTestLatencyMs,
+            deployRunUrl: deploy.deployRunUrl ?? deploy.ghRunUrl,
           }
         : null,
     };

@@ -310,9 +310,10 @@ export default async function RequirementDetailPage({
             <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
               <thead className="bg-slate-50 font-semibold uppercase text-slate-600">
                 <tr>
+                  <th className="px-4 py-2.5">Status &amp; Provider</th>
+                  <th className="px-4 py-2.5">Staging URL</th>
                   <th className="px-4 py-2.5">Smoke Test</th>
-                  <th className="px-4 py-2.5">Release</th>
-                  <th className="px-4 py-2.5">Commit</th>
+                  <th className="px-4 py-2.5">Commit / Release</th>
                   <th className="px-4 py-2.5">Actions Run</th>
                   <th className="px-4 py-2.5">Deployed At</th>
                 </tr>
@@ -320,52 +321,105 @@ export default async function RequirementDetailPage({
               <tbody className="divide-y divide-slate-200">
                 {detail.deployments.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-4 py-4 text-center text-slate-400">
+                    <td colSpan={6} className="px-4 py-4 text-center text-slate-400">
                       No deployments recorded.
                     </td>
                   </tr>
                 ) : (
-                  detail.deployments.map((dep) => (
-                    <tr key={dep.id}>
-                      <td className="px-4 py-3">
-                        <StatusBadge status={dep.smokeTestStatus} />
-                      </td>
-                      <td className="px-4 py-3">
-                        {dep.releaseTag && dep.releaseUrl ? (
-                          <a
-                            href={dep.releaseUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="font-mono font-medium text-emerald-700 hover:underline"
-                          >
-                            {dep.releaseTag}
-                          </a>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td className="px-4 py-3 font-mono text-slate-600">
-                        {dep.commitSha ? dep.commitSha.slice(0, 7) : "—"}
-                      </td>
-                      <td className="px-4 py-3">
-                        {dep.ghRunUrl ? (
-                          <a
-                            href={dep.ghRunUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-slate-600 hover:underline"
-                          >
-                            Actions Run
-                          </a>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-slate-500">
-                        {dep.deployedAt ? dep.deployedAt.toLocaleString() : "—"}
-                      </td>
-                    </tr>
-                  ))
+                  detail.deployments.map((dep) => {
+                    const runUrl = dep.deployRunUrl ?? dep.ghRunUrl;
+                    return (
+                      <tr key={dep.id}>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {dep.deployStatus ? (
+                              <span
+                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${
+                                  dep.deployStatus === "live"
+                                    ? "bg-emerald-100 text-emerald-800 ring-emerald-300"
+                                    : dep.deployStatus === "deploying"
+                                      ? "animate-pulse bg-amber-100 text-amber-800 ring-amber-300"
+                                      : "bg-rose-100 text-rose-800 ring-rose-300"
+                                }`}
+                              >
+                                {dep.deployStatus}
+                              </span>
+                            ) : (
+                              <StatusBadge status={dep.smokeTestStatus} />
+                            )}
+                            {dep.deployProvider && (
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-700">
+                                {dep.deployProvider === "render"
+                                  ? "Render Free · GHCR"
+                                  : dep.deployProvider}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {dep.stagingUrl ? (
+                            <a
+                              href={dep.stagingUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 font-medium text-emerald-700 hover:underline"
+                            >
+                              <span>{dep.stagingUrl}</span>
+                            </a>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {dep.smokeTestStatus === "PASSED" ? (
+                            <span className="rounded bg-emerald-50 px-1.5 py-0.5 font-mono text-[11px] text-emerald-800">
+                              {dep.smokeTestLatencyMs !== null
+                                ? `200 OK · ${dep.smokeTestLatencyMs}ms`
+                                : "200 OK"}
+                            </span>
+                          ) : dep.smokeTestStatus === "FAILED" ? (
+                            <span className="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-800">
+                              Smoke Failed
+                            </span>
+                          ) : (
+                            <StatusBadge status={dep.smokeTestStatus} />
+                          )}
+                        </td>
+                        <td className="px-4 py-3 space-x-2">
+                          <span className="font-mono text-slate-600">
+                            {dep.commitSha ? dep.commitSha.slice(0, 7) : "—"}
+                          </span>
+                          {dep.releaseTag && dep.releaseUrl && (
+                            <a
+                              href={dep.releaseUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="font-mono font-medium text-emerald-700 hover:underline"
+                            >
+                              {dep.releaseTag}
+                            </a>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {runUrl ? (
+                            <a
+                              href={runUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-slate-600 hover:underline"
+                            >
+                              Actions Run
+                            </a>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-slate-500">
+                          {dep.deployedAt ? dep.deployedAt.toLocaleString() : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

@@ -1,0 +1,103 @@
+name: Reusable Trigger Cursor Coding Agent
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        description: "Git ref of ankul01/agent-factory to check out"
+        required: false
+        type: string
+        default: "main"
+      head_ref:
+        description: "Merged plan PR head branch (e.g. plan/...)"
+        required: true
+        type: string
+      base_ref:
+        description: "Target base branch (default: main)"
+        required: false
+        type: string
+        default: "main"
+      merge_commit_sha:
+        description: "Merge commit SHA of the approved plan"
+        required: true
+        type: string
+      pr_number:
+        description: "Merged plan PR number"
+        required: false
+        type: string
+        default: ""
+      pr_body:
+        description: "Merged plan PR body"
+        required: false
+        type: string
+        default: ""
+      cursor_model:
+        description: "Optional Cursor model ID override"
+        required: false
+        type: string
+        default: ""
+      requirement_id:
+        description: "Optional orchestrator requirement UUID"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CURSOR_API_KEY:
+        required: false
+      ORCHESTRATOR_CALLBACK_SECRET:
+        required: false
+
+jobs:
+  launch-cursor-coder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target
+          ref: ${{ inputs.merge_commit_sha }}
+
+      - name: Checkout agent-factory engine
+        uses: actions/checkout@v4
+        with:
+          repository: ankul01/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          sparse-checkout: |
+            engine
+            skills
+            .agent-factory/prompts
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "factory/engine/pyproject.toml"
+
+      - name: Launch Cursor Cloud Agent via factory-engine
+        working-directory: target
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: ${{ inputs.cursor_model }}
+          GH_REPO: ${{ github.repository }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+          MERGE_COMMIT_SHA: ${{ inputs.merge_commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_BODY: ${{ inputs.pr_body }}
+          REQUIREMENT_ID: ${{ inputs.requirement_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FACTORY_CALLBACK_URL: ${{ vars.FACTORY_CALLBACK_URL }}
+          ORCHESTRATOR_URL: ${{ vars.ORCHESTRATOR_URL }}
+          ORCHESTRATOR_CALLBACK_SECRET: ${{ secrets.ORCHESTRATOR_CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          uv run --project ../factory/engine factory-engine trigger-coder \
+            --target-dir . \
+            --factory-dir ../factory

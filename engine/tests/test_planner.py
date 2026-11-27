@@ -209,3 +209,68 @@ def test_run_plan_writes_config_dir_creates_branch_and_posts_callback(
         "openQuestionsCount": 1,
         "modelUsed": "gemini-4-hydrogen",
     }
+
+
+@respx.mock
+def test_run_plan_commits_only_plan_file_ignoring_prestaged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("FACTORY_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_URL", raising=False)
+
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    _init_git_repo(target_dir)
+
+    # Pre-stage an unrelated file in the index before run_plan runs
+    unrelated = target_dir / "unrelated_staged.txt"
+    unrelated.write_text("should not be committed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "unrelated_staged.txt"], cwd=target_dir, check=True, capture_output=True
+    )
+
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": "## Scope\n- Task"}]}}]},
+        )
+    )
+
+    gh = MagicMock()
+    gh.repo = "ankul01/task-manager"
+    gh.create_pull_request.return_value = {"number": 99, "html_url": "https://example.com/pr/99"}
+
+    original_run = subprocess.run
+
+    def fake_run(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        if cmd[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return original_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_plan(
+        target_dir=target_dir,
+        factory_dir=factory_dir,
+        requirement="Add isolated plan commit",
+        raw_slug="isolated-commit",
+        github_client=gh,
+        llm_client=_planner_llm_client(),
+    )
+
+    committed_files = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=target_dir,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines()
+    assert committed_files == [result.plan_path]
+    assert "unrelated_staged.txt" not in committed_files

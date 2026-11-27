@@ -85,9 +85,12 @@ def test_run_trigger_coder_launches_agent_and_posts_callback(
         return_value=httpx.Response(
             200,
             json={
-                "id": "bc_12345",
-                "runId": "run_999",
-                "url": "https://cursor.com/agents/bc_12345",
+                "agent": {
+                    "id": "bc_12345",
+                    "url": "https://cursor.com/agents/bc_12345",
+                    "target": {"branchName": "cursor/add-tags-a1b2"},
+                },
+                "run": {"id": "run_999"},
             },
         )
     )
@@ -114,7 +117,7 @@ def test_run_trigger_coder_launches_agent_and_posts_callback(
     assert result.cursor_agent_id == "bc_12345"
     assert result.cursor_run_id == "run_999"
     assert result.cursor_tracking_url == "https://cursor.com/agents/bc_12345"
-    assert result.branch_name == "feat/20261127-190000-add-tags"
+    assert result.branch_name == "cursor/add-tags-a1b2"
 
     assert cursor_route.call_count == 1
     req = cursor_route.calls[0].request
@@ -142,7 +145,7 @@ def test_run_trigger_coder_launches_agent_and_posts_callback(
         "stage": "coding",
         "status": "RUNNING",
         "planPath": "docs/plans/20261127-190000-add-tags.md",
-        "branchName": "feat/20261127-190000-add-tags",
+        "branchName": "cursor/add-tags-a1b2",
         "mergeCommitSha": "deadbeef1234",
         "ghRunId": "321",
         "ghRunUrl": "https://github.com/ankul01/task-manager/actions/runs/321",
@@ -267,3 +270,45 @@ def test_run_trigger_coder_timeout_sends_failed_callback_no_leak(
     assert fail_payload["status"] == "FAILED"
     assert "ReadTimeout" in fail_payload["failureReason"]
     assert secret_key not in fail_payload["failureReason"]
+    assert "branchName" not in fail_payload
+
+
+@respx.mock
+def test_run_trigger_coder_omits_branch_when_not_in_cursor_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_url = "https://factory.example.com/api/callbacks/workflow"
+    monkeypatch.setenv("FACTORY_CALLBACK_URL", callback_url)
+    monkeypatch.setenv("ORCHESTRATOR_CALLBACK_SECRET", "cb-secret")
+
+    target_dir = tmp_path / "target"
+    plan_file = target_dir / "docs" / "plans" / "20261127-190000-add-tags.md"
+    plan_file.parent.mkdir(parents=True)
+    plan_file.write_text("# Plan\n", encoding="utf-8")
+
+    respx.post(CURSOR_AGENTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"agent": {"id": "bc_777"}, "run": {"id": "run_777"}},
+        )
+    )
+    cb_route = respx.post(callback_url).mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+
+    result = run_trigger_coder(
+        target_dir=target_dir,
+        factory_dir=tmp_path,
+        cursor_api_key="cur_key",
+        repo="ankul01/task-manager",
+        repo_url="https://github.com/ankul01/task-manager",
+        merge_commit_sha="deadbeef",
+        head_ref="plan/20261127-190000-add-tags",
+    )
+
+    assert result.branch_name is None
+    assert result.cursor_agent_id == "bc_777"
+    assert result.cursor_tracking_url == "https://cursor.com/agents/bc_777"
+    cb_payload = json.loads(cb_route.calls[0].request.content.decode("utf-8"))
+    assert "branchName" not in cb_payload

@@ -29,7 +29,7 @@ class TriggerCoderResult:
     plan_id: str
     slug: str
     plan_path: str
-    branch_name: str
+    branch_name: str | None
     merge_commit_sha: str
     cursor_agent_id: str | None
     cursor_run_id: str | None
@@ -135,7 +135,6 @@ def run_trigger_coder(
         pr_body=pr_body,
     )
     slug = extract_slug_from_plan_id(plan_id)
-    feature_branch = f"feat/{plan_id}"
     merge_sha = merge_commit_sha.strip()
     if not merge_sha:
         raise ValueError("merge_commit_sha is required.")
@@ -154,7 +153,7 @@ def run_trigger_coder(
             plan_id=plan_id,
             slug=slug,
             plan_path=rel_plan_path,
-            branch_name=feature_branch,
+            branch_name=None,
             merge_commit_sha=merge_sha,
             cursor_agent_id=None,
             cursor_run_id=None,
@@ -169,7 +168,6 @@ def run_trigger_coder(
             slug=slug,
             status="FAILED",
             plan_path=rel_plan_path,
-            feature_branch=feature_branch,
             merge_commit_sha=merge_sha,
             requirement_id=requirement_id,
             gh_run_id=gh_run_id,
@@ -216,7 +214,6 @@ def run_trigger_coder(
             slug=slug,
             status="FAILED",
             plan_path=rel_plan_path,
-            feature_branch=feature_branch,
             merge_commit_sha=merge_sha,
             requirement_id=requirement_id,
             gh_run_id=gh_run_id,
@@ -231,7 +228,6 @@ def run_trigger_coder(
             slug=slug,
             status="FAILED",
             plan_path=rel_plan_path,
-            feature_branch=feature_branch,
             merge_commit_sha=merge_sha,
             requirement_id=requirement_id,
             gh_run_id=gh_run_id,
@@ -240,12 +236,24 @@ def run_trigger_coder(
         )
         raise CoderTriggerError(err_msg) from exc
 
-    agent_id = result.get("id")
-    run_id = result.get("runId")
+    agent_obj = result.get("agent") if isinstance(result.get("agent"), dict) else {}
+    run_obj = result.get("run") if isinstance(result.get("run"), dict) else {}
+    target_obj = agent_obj.get("target") if isinstance(agent_obj.get("target"), dict) else {}
+
+    agent_id = agent_obj.get("id") or result.get("id")
+    run_id = run_obj.get("id") or result.get("runId")
     tracking_url = (
-        result.get("url")
+        agent_obj.get("url")
+        or run_obj.get("url")
+        or result.get("url")
         or result.get("trackingUrl")
         or (f"https://cursor.com/agents/{agent_id}" if agent_id else None)
+    )
+    actual_branch = (
+        target_obj.get("branchName")
+        or agent_obj.get("branchName")
+        or result.get("branchName")
+        or None
     )
 
     _send_coding_callback(
@@ -253,7 +261,7 @@ def run_trigger_coder(
         slug=slug,
         status="RUNNING",
         plan_path=rel_plan_path,
-        feature_branch=feature_branch,
+        feature_branch=actual_branch,
         merge_commit_sha=merge_sha,
         requirement_id=requirement_id,
         gh_run_id=gh_run_id,
@@ -267,7 +275,7 @@ def run_trigger_coder(
         plan_id=plan_id,
         slug=slug,
         plan_path=rel_plan_path,
-        branch_name=feature_branch,
+        branch_name=actual_branch,
         merge_commit_sha=merge_sha,
         cursor_agent_id=agent_id,
         cursor_run_id=run_id,
@@ -280,8 +288,8 @@ def _send_coding_callback(
     slug: str,
     status: str,
     plan_path: str,
-    feature_branch: str,
     merge_commit_sha: str,
+    feature_branch: str | None = None,
     requirement_id: str | None = None,
     gh_run_id: str | None = None,
     gh_run_url: str | None = None,

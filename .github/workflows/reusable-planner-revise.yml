@@ -1,0 +1,126 @@
+name: Reusable Revise a Plan from PR Feedback
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        description: "Git ref of ankul01/agent-factory to check out"
+        required: false
+        type: string
+        default: "main"
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: number
+      comment_body:
+        description: "Comment body containing /revise feedback"
+        required: true
+        type: string
+      model:
+        description: "Optional model override"
+        required: false
+        type: string
+        default: ""
+      requirement_id:
+        description: "Optional orchestrator requirement UUID"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      NVIDIA_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      ORCHESTRATOR_CALLBACK_SECRET:
+        required: false
+
+jobs:
+  revise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Validate PR & branch
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        shell: bash
+        run: |
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json headRefName,state)
+          STATE=$(echo "$PR_JSON" | jq -r .state)
+          HEAD_REF=$(echo "$PR_JSON" | jq -r .headRefName)
+
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUMBER is not OPEN (state: $STATE). Exiting."
+            exit 0
+          fi
+
+          if [[ "$HEAD_REF" != plan/* ]]; then
+            echo "PR headRefName '$HEAD_REF' does not start with 'plan/'. Exiting."
+            exit 0
+          fi
+
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target PR branch
+        if: steps.pr_info.outputs.head_ref != ''
+        uses: actions/checkout@v4
+        with:
+          path: target
+          ref: ${{ steps.pr_info.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Checkout agent-factory engine
+        if: steps.pr_info.outputs.head_ref != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ankul01/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          sparse-checkout: |
+            engine
+            skills
+            .agent-factory/prompts
+
+      - name: Set up uv and Python 3.12
+        if: steps.pr_info.outputs.head_ref != ''
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "factory/engine/pyproject.toml"
+
+      - name: Revise plan and reply on PR via factory-engine
+        if: steps.pr_info.outputs.head_ref != ''
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ steps.pr_info.outputs.head_ref }}
+          COMMENT_BODY: ${{ inputs.comment_body }}
+          MODEL_OVERRIDE: ${{ inputs.model }}
+          REQUIREMENT_ID: ${{ inputs.requirement_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FACTORY_CALLBACK_URL: ${{ vars.FACTORY_CALLBACK_URL }}
+          ORCHESTRATOR_URL: ${{ vars.ORCHESTRATOR_URL }}
+          ORCHESTRATOR_CALLBACK_SECRET: ${{ secrets.ORCHESTRATOR_CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          uv run --project ../factory/engine factory-engine revise \
+            --target-dir . \
+            --factory-dir ../factory

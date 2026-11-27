@@ -8,6 +8,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from factory_engine.stages.planner import run_plan
+from factory_engine.stages.planner_revise import run_revise
 from factory_engine.stages.pr_review import run_pr_review
 
 
@@ -42,7 +44,80 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         sub = subparsers.add_parser(name, help=help_text)
         _add_common_args(sub)
-        if name == "review":
+        if name == "plan":
+            sub.add_argument(
+                "--requirement",
+                default=None,
+                help="Requirement text (defaults to REQUIREMENT or PROMPT_TEXT env var).",
+            )
+            sub.add_argument(
+                "--slug",
+                default=None,
+                help="Optional short slug (defaults to RAW_SLUG env var).",
+            )
+            sub.add_argument(
+                "--requirement-id",
+                default=None,
+                help="Optional orchestrator requirement UUID (defaults to REQUIREMENT_ID).",
+            )
+            sub.add_argument(
+                "--model-override",
+                default=None,
+                help="Optional LLM model override (defaults to MODEL_OVERRIDE).",
+            )
+            sub.add_argument(
+                "--run-url",
+                default="",
+                help="Workflow run URL (defaults to RUN_URL).",
+            )
+            sub.add_argument(
+                "--base-branch",
+                default=None,
+                help="Base branch for the plan PR (defaults to BASE_BRANCH or 'main').",
+            )
+            sub.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Generate plan file locally without git push, PR creation, or callback.",
+            )
+        elif name == "revise":
+            sub.add_argument(
+                "--pr-number",
+                type=int,
+                default=None,
+                help="Pull request number (defaults to PR_NUMBER env var).",
+            )
+            sub.add_argument(
+                "--head-ref",
+                default=None,
+                help="PR head branch name (defaults to HEAD_REF env var).",
+            )
+            sub.add_argument(
+                "--comment-body",
+                default=None,
+                help="PR comment body containing /revise feedback (defaults to COMMENT_BODY).",
+            )
+            sub.add_argument(
+                "--requirement-id",
+                default=None,
+                help="Optional orchestrator requirement UUID (defaults to REQUIREMENT_ID).",
+            )
+            sub.add_argument(
+                "--model-override",
+                default=None,
+                help="Optional LLM model override (defaults to MODEL_OVERRIDE).",
+            )
+            sub.add_argument(
+                "--run-url",
+                default="",
+                help="Workflow run URL (defaults to RUN_URL).",
+            )
+            sub.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Revise plan file locally without git push, PR comment, or callback.",
+            )
+        elif name == "review":
             sub.add_argument(
                 "--pr-number",
                 type=int,
@@ -85,6 +160,66 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     target_dir = args.target_dir.resolve()
     factory_dir = args.factory_dir.resolve()
+
+    if args.command == "plan":
+        requirement = (
+            args.requirement
+            if args.requirement is not None
+            else (os.environ.get("REQUIREMENT") or os.environ.get("PROMPT_TEXT") or "")
+        )
+        if not requirement.strip():
+            parser.error("--requirement or REQUIREMENT/PROMPT_TEXT env var is required for 'plan'.")
+        result = run_plan(
+            target_dir=target_dir,
+            factory_dir=factory_dir,
+            requirement=requirement,
+            raw_slug=(
+                args.slug if args.slug is not None else os.environ.get("RAW_SLUG", "")
+            ),
+            requirement_id=args.requirement_id or os.environ.get("REQUIREMENT_ID") or None,
+            model_override=args.model_override or os.environ.get("MODEL_OVERRIDE"),
+            run_url=args.run_url or os.environ.get("RUN_URL", ""),
+            gh_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+            base_branch=args.base_branch or os.environ.get("BASE_BRANCH") or "main",
+            dry_run=args.dry_run,
+        )
+        print(
+            f"[factory-engine] plan complete: plan_id={result.plan_id} "
+            f"branch={result.branch_name} pr=#{result.pr_number}"
+        )
+        return 0
+
+    if args.command == "revise":
+        raw_pr = args.pr_number or os.environ.get("PR_NUMBER", "").strip()
+        if not raw_pr:
+            parser.error("--pr-number or PR_NUMBER env var is required for 'revise'.")
+        head_ref = (
+            args.head_ref if args.head_ref is not None else os.environ.get("HEAD_REF", "")
+        ).strip()
+        if not head_ref:
+            parser.error("--head-ref or HEAD_REF env var is required for 'revise'.")
+        comment_body = (
+            args.comment_body
+            if args.comment_body is not None
+            else os.environ.get("COMMENT_BODY", "")
+        )
+        result = run_revise(
+            target_dir=target_dir,
+            factory_dir=factory_dir,
+            pr_number=int(raw_pr),
+            head_ref=head_ref,
+            comment_body=comment_body,
+            requirement_id=args.requirement_id or os.environ.get("REQUIREMENT_ID") or None,
+            model_override=args.model_override or os.environ.get("MODEL_OVERRIDE"),
+            run_url=args.run_url or os.environ.get("RUN_URL", ""),
+            gh_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+            dry_run=args.dry_run,
+        )
+        print(
+            f"[factory-engine] revise complete: plan_id={result.plan_id} "
+            f"pr=#{result.pr_number} commit={result.commit_sha}"
+        )
+        return 0
 
     if args.command == "review":
         raw_pr = args.pr_number or os.environ.get("PR_NUMBER", "").strip()

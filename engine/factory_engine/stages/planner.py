@@ -280,8 +280,11 @@ def run_plan(
         _run_git(["config", "user.name", _BOT_NAME], cwd=target_path)
         _run_git(["config", "user.email", _BOT_EMAIL], cwd=target_path)
         _run_git(["checkout", "-b", branch_name], cwd=target_path)
-        _run_git(["add", rel_plan_path], cwd=target_path)
-        _run_git(["commit", "-m", f"plan: add draft spec {plan_id}"], cwd=target_path)
+        _run_git(["add", "--", rel_plan_path], cwd=target_path)
+        _run_git(
+            ["commit", "--only", rel_plan_path, "-m", f"plan: add draft spec {plan_id}"],
+            cwd=target_path,
+        )
         _run_git(["push", "origin", branch_name], cwd=target_path)
 
         pr_body = format_plan_pr_body(

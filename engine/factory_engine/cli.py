@@ -11,6 +11,7 @@ from pathlib import Path
 from factory_engine.stages.planner import run_plan
 from factory_engine.stages.planner_revise import run_revise
 from factory_engine.stages.pr_review import run_pr_review
+from factory_engine.stages.trigger_coder import run_trigger_coder
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -117,6 +118,48 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="Revise plan file locally without git push, PR comment, or callback.",
             )
+        elif name == "trigger-coder":
+            sub.add_argument(
+                "--head-ref",
+                default=None,
+                help="Merged plan PR head ref (defaults to HEAD_REF env var).",
+            )
+            sub.add_argument(
+                "--base-branch",
+                default=None,
+                help="Base branch name (defaults to BASE_REF or 'main').",
+            )
+            sub.add_argument(
+                "--merge-sha",
+                default=None,
+                help="Merge commit SHA (defaults to MERGE_COMMIT_SHA or MERGE_SHA).",
+            )
+            sub.add_argument(
+                "--pr-number",
+                type=int,
+                default=None,
+                help="Optional merged PR number (defaults to PR_NUMBER).",
+            )
+            sub.add_argument(
+                "--pr-body",
+                default=None,
+                help="Optional PR body text (defaults to PR_BODY).",
+            )
+            sub.add_argument(
+                "--requirement-id",
+                default=None,
+                help="Optional orchestrator requirement UUID (defaults to REQUIREMENT_ID).",
+            )
+            sub.add_argument(
+                "--run-url",
+                default="",
+                help="Workflow run URL (defaults to RUN_URL).",
+            )
+            sub.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Build prompt without calling Cursor API or callback.",
+            )
         elif name == "review":
             sub.add_argument(
                 "--pr-number",
@@ -218,6 +261,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"[factory-engine] revise complete: plan_id={result.plan_id} "
             f"pr=#{result.pr_number} commit={result.commit_sha}"
+        )
+        return 0
+
+    if args.command == "trigger-coder":
+        repo = os.environ.get("GH_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+        server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+        repo_url = os.environ.get("REPO_URL") or (f"{server_url}/{repo}" if repo else "")
+        merge_sha = (
+            args.merge_sha
+            if args.merge_sha is not None
+            else (
+                os.environ.get("MERGE_COMMIT_SHA")
+                or os.environ.get("MERGE_SHA")
+                or os.environ.get("GITHUB_SHA")
+                or ""
+            )
+        )
+        raw_pr = args.pr_number or os.environ.get("PR_NUMBER", "").strip()
+        pr_number = int(raw_pr) if raw_pr else None
+        result = run_trigger_coder(
+            target_dir=target_dir,
+            factory_dir=factory_dir,
+            cursor_api_key=os.environ.get("CURSOR_API_KEY", ""),
+            repo=repo,
+            repo_url=repo_url,
+            merge_commit_sha=merge_sha,
+            head_ref=args.head_ref if args.head_ref is not None else os.environ.get("HEAD_REF", ""),
+            base_branch=args.base_branch or os.environ.get("BASE_REF") or "main",
+            pr_number=pr_number,
+            pr_body=args.pr_body if args.pr_body is not None else os.environ.get("PR_BODY", ""),
+            cursor_model=os.environ.get("CURSOR_MODEL", ""),
+            requirement_id=args.requirement_id or os.environ.get("REQUIREMENT_ID") or None,
+            run_url=args.run_url or os.environ.get("RUN_URL", ""),
+            gh_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+            dry_run=args.dry_run,
+        )
+        print(
+            f"[factory-engine] trigger-coder complete: plan_id={result.plan_id} "
+            f"agent_id={result.cursor_agent_id}"
         )
         return 0
 

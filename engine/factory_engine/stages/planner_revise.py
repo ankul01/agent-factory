@@ -206,16 +206,22 @@ def run_revise(
     if not dry_run:
         _run_git(["config", "user.name", _BOT_NAME], cwd=target_path)
         _run_git(["config", "user.email", _BOT_EMAIL], cwd=target_path)
-        _run_git(["add", rel_plan_path], cwd=target_path)
+        _run_git(["add", "--", rel_plan_path], cwd=target_path)
         diff_check = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
+            ["git", "diff", "--cached", "--quiet", "--", rel_plan_path],
             cwd=target_path,
             check=False,
         )
         has_changes = diff_check.returncode != 0
         if has_changes:
             _run_git(
-                ["commit", "-m", f"plan: revise {plan_id} from PR feedback"],
+                [
+                    "commit",
+                    "--only",
+                    rel_plan_path,
+                    "-m",
+                    f"plan: revise {plan_id} from PR feedback",
+                ],
                 cwd=target_path,
             )
             _run_git(["push", "origin", f"HEAD:{head_ref}"], cwd=target_path)

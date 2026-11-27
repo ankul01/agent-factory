@@ -254,3 +254,83 @@ def test_run_revise_ignores_planner_prompt_and_handles_no_diff(
     gh.comment_on_pr.assert_called_once()
     posted_comment = gh.comment_on_pr.call_args[0][1]
     assert "no file changes were needed" in posted_comment
+
+
+@respx.mock
+def test_run_revise_commits_only_plan_file_ignoring_prestaged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("FACTORY_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_URL", raising=False)
+
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    _init_git_repo(target_dir)
+
+    plan_id = "20261127-180000-add-due-dates"
+    head_ref = f"plan/{plan_id}"
+    subprocess.run(
+        ["git", "checkout", "-b", head_ref], cwd=target_dir, check=True, capture_output=True
+    )
+    plan_file = target_dir / "docs" / "plans" / f"{plan_id}.md"
+    plan_file.parent.mkdir(parents=True)
+    plan_file.write_text("# Old\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", f"docs/plans/{plan_id}.md"], cwd=target_dir, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "draft"], cwd=target_dir, check=True, capture_output=True
+    )
+
+    # Pre-stage an unrelated file in the index before run_revise runs
+    (target_dir / "unrelated_staged.txt").write_text("do not commit\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "unrelated_staged.txt"], cwd=target_dir, check=True, capture_output=True
+    )
+
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": "# Revised\n"}]}}]},
+        )
+    )
+
+    gh = MagicMock()
+    gh.repo = "ankul01/task-manager"
+    gh.comment_on_pr.return_value = {"html_url": "https://example.com/comment/1"}
+
+    original_run = subprocess.run
+
+    def fake_run(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        if cmd[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return original_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_revise(
+        target_dir=target_dir,
+        factory_dir=factory_dir,
+        pr_number=12,
+        head_ref=head_ref,
+        comment_body="/revise Update title",
+        github_client=gh,
+        llm_client=_planner_llm_client(),
+    )
+
+    committed_files = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=target_dir,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines()
+    assert committed_files == [result.plan_path]
+    assert "unrelated_staged.txt" not in committed_files

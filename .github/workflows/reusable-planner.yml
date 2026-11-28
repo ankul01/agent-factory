@@ -1,0 +1,96 @@
+name: Reusable Plan a Requirement
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        description: "Git ref of ankul01/agent-factory to check out"
+        required: false
+        type: string
+        default: "main"
+      requirement:
+        description: "A small, non-sensitive product requirement"
+        required: true
+        type: string
+      slug:
+        description: "Short filename label (optional, e.g. add-due-dates)"
+        required: false
+        type: string
+        default: ""
+      model:
+        description: "Optional model override (e.g. gemini-3.8-flash)"
+        required: false
+        type: string
+        default: ""
+      requirement_id:
+        description: "Optional orchestrator requirement UUID"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      NVIDIA_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      ORCHESTRATOR_CALLBACK_SECRET:
+        required: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target
+
+      - name: Checkout agent-factory engine
+        uses: actions/checkout@v4
+        with:
+          repository: ankul01/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          sparse-checkout: |
+            engine
+            skills
+            .agent-factory/prompts
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "factory/engine/pyproject.toml"
+
+      - name: Generate draft plan and open PR via factory-engine
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUIREMENT: ${{ inputs.requirement }}
+          RAW_SLUG: ${{ inputs.slug }}
+          MODEL_OVERRIDE: ${{ inputs.model }}
+          REQUIREMENT_ID: ${{ inputs.requirement_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FACTORY_CALLBACK_URL: ${{ vars.FACTORY_CALLBACK_URL }}
+          ORCHESTRATOR_URL: ${{ vars.ORCHESTRATOR_URL }}
+          ORCHESTRATOR_CALLBACK_SECRET: ${{ secrets.ORCHESTRATOR_CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          uv run --project ../factory/engine factory-engine plan \
+            --target-dir . \
+            --factory-dir ../factory

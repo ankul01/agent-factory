@@ -1,0 +1,139 @@
+name: Reusable PR Tests and AI Code Review
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        description: "Git ref of ankul01/agent-factory to check out"
+        required: false
+        type: string
+        default: "main"
+      runtime:
+        description: "Target project runtime (java21 | node22 | python312 | none)"
+        required: false
+        type: string
+        default: "none"
+      test_command:
+        description: "Optional test command override"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      NVIDIA_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      ORCHESTRATOR_CALLBACK_SECRET:
+        required: false
+
+jobs:
+  pr-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout target PR head
+        uses: actions/checkout@v4
+        with:
+          path: target
+
+      - name: Checkout agent-factory engine
+        uses: actions/checkout@v4
+        with:
+          repository: ankul01/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          sparse-checkout: |
+            engine
+            skills
+            .agent-factory/prompts
+
+      - name: Set up Java 21
+        if: inputs.runtime == 'java21'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: target/pom.xml
+
+      - name: Set up Node 22
+        if: inputs.runtime == 'node22'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: target/package-lock.json
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "factory/engine/pyproject.toml"
+
+      - name: Run target test suite
+        id: tests
+        continue-on-error: true
+        working-directory: target
+        env:
+          INPUT_RUNTIME: ${{ inputs.runtime }}
+          INPUT_TEST_CMD: ${{ inputs.test_command }}
+        shell: bash
+        run: |
+          TEST_CMD="$INPUT_TEST_CMD"
+          if [ -z "$TEST_CMD" ]; then
+            TEST_CMD=$(uv run --project ../factory/engine python -c "from pathlib import Path; from factory_engine.config import load_config; print(load_config(Path('.')).test_command or '')")
+          fi
+          if [ -n "$TEST_CMD" ]; then
+            bash -c "$TEST_CMD"
+          elif [ "$INPUT_RUNTIME" = "java21" ] && [ -f pom.xml ]; then
+            mvn -B test
+          elif [ "$INPUT_RUNTIME" = "node22" ] && [ -f package.json ]; then
+            npm ci && npm test
+          elif [ "$INPUT_RUNTIME" = "python312" ]; then
+            if [ ! -f pyproject.toml ] && [ -f requirements.txt ]; then
+              uv run --with-requirements requirements.txt --with pytest pytest -v
+            else
+              uv run pytest -v
+            fi
+          else
+            echo "No test command configured for runtime '$INPUT_RUNTIME'; skipping tests."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run AI PR review via factory-engine
+        continue-on-error: true
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST_STATUS: ${{ steps.tests.outcome == 'failure' && 'FAILED' || (steps.tests.outputs.skipped == 'true' && 'PENDING' || 'PASSED') }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FACTORY_CALLBACK_URL: ${{ vars.FACTORY_CALLBACK_URL }}
+          ORCHESTRATOR_URL: ${{ vars.ORCHESTRATOR_URL }}
+          ORCHESTRATOR_CALLBACK_SECRET: ${{ secrets.ORCHESTRATOR_CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          uv run --project ../factory/engine factory-engine review \
+            --target-dir . \
+            --factory-dir ../factory
+
+      - name: Fail if target tests failed
+        if: steps.tests.outcome == 'failure'
+        shell: bash
+        run: exit 1

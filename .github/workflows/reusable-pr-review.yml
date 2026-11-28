@@ -18,6 +18,17 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      NVIDIA_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      ORCHESTRATOR_CALLBACK_SECRET:
+        required: false
 
 jobs:
   pr-review:
@@ -88,9 +99,14 @@ jobs:
           elif [ "$INPUT_RUNTIME" = "node22" ] && [ -f package.json ]; then
             npm ci && npm test
           elif [ "$INPUT_RUNTIME" = "python312" ]; then
-            uv run pytest -v
+            if [ ! -f pyproject.toml ] && [ -f requirements.txt ]; then
+              uv run --with-requirements requirements.txt --with pytest pytest -v
+            else
+              uv run pytest -v
+            fi
           else
             echo "No test command configured for runtime '$INPUT_RUNTIME'; skipping tests."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run AI PR review via factory-engine
@@ -103,7 +119,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TEST_STATUS: ${{ steps.tests.outcome == 'failure' && 'FAILED' || 'PASSED' }}
+          TEST_STATUS: ${{ steps.tests.outcome == 'failure' && 'FAILED' || (steps.tests.outputs.skipped == 'true' && 'PENDING' || 'PASSED') }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

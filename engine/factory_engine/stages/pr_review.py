@@ -13,6 +13,7 @@ from factory_engine.github.api import GitHubClient
 from factory_engine.github.callback import CallbackPayload, post_workflow_callback
 from factory_engine.llm.client import LLMClient, LLMError
 from factory_engine.prompts.loader import load_prompts
+from factory_engine.stages.planner_revise import extract_slug_from_plan_id
 
 ReviewVerdict = Literal["PENDING", "APPROVED", "CHANGES_REQUESTED"]
 TestStatus = Literal["PENDING", "PASSED", "FAILED"]
@@ -265,6 +266,7 @@ def run_pr_review(
         print(f"[pr-review] LLM waterfall failed; posting fallback notice: {exc}")
 
     effective_run_url = run_url or _default_run_url()
+    is_truncated = len(diff_text) > MAX_DIFF_CHARS
     comment_body = format_review_comment(
         review_text=review_text,
         model=model_used,
@@ -272,9 +274,22 @@ def run_pr_review(
         run_url=effective_run_url,
         test_status=normalized_test_status,
     )
-    metrics = extract_review_metrics(comment_body) if review_text else ReviewMetrics(
-        verdict="PENDING", p0_count=0, p1_count=0
+    metrics = (
+        extract_review_metrics(comment_body)
+        if review_text
+        else ReviewMetrics(verdict="PENDING", p0_count=0, p1_count=0)
     )
+    if is_truncated and metrics.verdict == "APPROVED":
+        metrics = ReviewMetrics(
+            verdict="PENDING",
+            p0_count=metrics.p0_count,
+            p1_count=metrics.p1_count,
+        )
+        warning_note = (
+            "> **Warning:** PR diff exceeded 100,000 characters and was truncated; "
+            "automated approval has been downgraded to `PENDING` for human review.\n\n"
+        )
+        comment_body = warning_note + comment_body
 
     comment_url: str | None = None
     if not dry_run:
@@ -329,7 +344,8 @@ def _send_review_callback(
     if "/" not in gh.repo:
         return
     owner, repo_name = gh.repo.split("/", 1)
-    slug = head_ref.split("/", 1)[-1] or f"pr-{pr_number}"
+    raw_tail = head_ref.split("/", 1)[-1]
+    slug = extract_slug_from_plan_id(raw_tail) if raw_tail else f"pr-{pr_number}"
     payload = CallbackPayload(
         repoOwner=owner,
         repoName=repo_name,

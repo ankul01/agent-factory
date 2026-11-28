@@ -244,3 +244,79 @@ def test_send_review_callback_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     assert sent["p1Count"] == 2
     assert sent["ghRunId"] == "777"
     assert sent["slug"] == "add-auth"
+
+
+@respx.mock
+def test_send_review_callback_strips_plan_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from factory_engine.stages.pr_review import ReviewMetrics, _send_review_callback
+
+    callback_url = "https://factory.example.com/api/callbacks/workflow"
+    monkeypatch.setenv("FACTORY_CALLBACK_URL", callback_url)
+    monkeypatch.setenv("ORCHESTRATOR_CALLBACK_SECRET", "test-secret")
+
+    route = respx.post(callback_url).mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+
+    gh = MagicMock()
+    gh.repo = "ankul01/task-manager"
+
+    _send_review_callback(
+        gh=gh,
+        pr_number=43,
+        run_url="https://github.com/ankul01/task-manager/actions/runs/778",
+        test_status="PASSED",
+        metrics=ReviewMetrics(verdict="APPROVED", p0_count=0, p1_count=0),
+        model_used="gemini-4-hydrogen",
+        comment_url="https://github.com/ankul01/task-manager/pull/43#issuecomment-1",
+        head_ref="feat/20261127-190000-add-tags",
+        gh_run_id="778",
+    )
+
+    sent = json.loads(route.calls[0].request.content.decode("utf-8"))
+    assert sent["slug"] == "add-tags"
+
+
+@respx.mock
+def test_run_pr_review_downgrades_approved_when_diff_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("FACTORY_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_URL", raising=False)
+
+    gh = MagicMock()
+    gh.repo = "ankul01/task-manager"
+    gh.get_pr_diff.return_value = "a" * (MAX_DIFF_CHARS + 500)
+    gh.get_pull_request.return_value = {"body": ""}
+    gh.comment_on_pr.return_value = {
+        "html_url": "https://github.com/ankul01/task-manager/pull/99#issuecomment-1"
+    }
+
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": "- **Verdict:** `APPROVED`"}]}}
+                ]
+            },
+        )
+    )
+
+    result = run_pr_review(
+        target_dir=tmp_path,
+        factory_dir=tmp_path,
+        pr_number=99,
+        github_client=gh,
+        llm_client=_reviewer_client(),
+    )
+
+    assert result.verdict == "PENDING"
+    assert "truncated" in result.comment_body.lower()
+    assert "downgraded to `PENDING`" in result.comment_body
